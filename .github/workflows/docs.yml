@@ -12,20 +12,22 @@ jobs:
     runs-on: [ubuntu-latest]
     outputs:
       isDoc: ${{ steps.diff.outputs.isDoc }}
+      isOldDoc: ${{ steps.diff.outputs.isOldDoc }}
     steps:
-    - uses: actions/checkout@v3
-    - name: Detect Changes
-      uses: './.github/actions/diffs'
-      id: diff
-
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # Pin v4.1.1
+      - name: Detect Changes
+        uses: './.github/actions/diffs'
+        id: diff
+  
   spelling:
     name: Lint documentation
     needs: diff
     if: needs.diff.outputs.isDoc == 'true'
     runs-on: [ubuntu-latest]
+
     steps:
-    - uses: actions/checkout@v3
-    - name: Spell Check Docs
-      uses: crate-ci/typos@master
-      with:
-        files: ./doc ./*.md
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # Pin v4.1.1
+      - name: Spell Check Docs
+        uses: crate-ci/typos@v1.16.11
+        with:
+          files: ./docs/content

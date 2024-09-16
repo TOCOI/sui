@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::time::Duration;
 use test_utils::cluster::{setup_tracing, Cluster};
 use tracing::info;
-use types::{TransactionProto, TransactionsClient};
+use types::TransactionProto;
 
 type StringTransaction = String;
 
@@ -15,19 +15,13 @@ async fn test_restore_from_disk() {
     // nodes logs.
     let _guard = setup_tracing();
 
-    let mut cluster = Cluster::new(None, true);
+    let mut cluster = Cluster::new(None);
 
     // start the cluster
     cluster.start(Some(4), Some(1), None).await;
 
     let id = 0;
-    let name = cluster.authority(0).name;
-
-    let worker_cache = &cluster.worker_cache_shared;
-    let address = worker_cache.load().worker(&name, &id).unwrap().transactions;
-    let config = mysten_network::config::Config::new();
-    let channel = config.connect_lazy(&address).unwrap();
-    let mut client = TransactionsClient::new(channel);
+    let client = cluster.authority(0).new_transactions_client(&id).await;
 
     // Subscribe to the transaction confirmation channel
     let mut receiver = cluster
@@ -38,24 +32,28 @@ async fn test_restore_from_disk() {
         .subscribe();
 
     // Create arbitrary transactions
-    let mut batch_len = 3;
+    let mut total_tx = 3;
     for tx in [
         string_transaction(),
         string_transaction(),
         string_transaction(),
     ] {
-        let tr = bincode::serialize(&tx).unwrap();
-        let txn = TransactionProto {
-            transaction: Bytes::from(tr),
-        };
-        client.submit_transaction(txn).await.unwrap();
+        let mut c = client.clone();
+        tokio::spawn(async move {
+            let tr = bcs::to_bytes(&tx).unwrap();
+            let txn = TransactionProto {
+                transactions: vec![Bytes::from(tr)],
+            };
+
+            c.submit_transaction(txn).await.unwrap();
+        });
     }
 
     // wait for transactions to complete
     loop {
         if let Ok(_result) = receiver.recv().await {
-            batch_len -= 1;
-            if batch_len < 1 {
+            total_tx -= 1;
+            if total_tx < 1 {
                 break;
             }
         }
@@ -79,7 +77,7 @@ async fn test_restore_from_disk() {
     let primary = node.primary().await;
 
     let node_recovered_state =
-        if let Some(metric) = primary.metric("narwhal_primary_recovered_consensus_state") {
+        if let Some(metric) = primary.metric("recovered_consensus_state").await {
             let value = metric.get_counter().get_value();
             info!("Found metric for recovered consensus state.");
 
@@ -98,13 +96,13 @@ fn string_transaction() -> StringTransaction {
 #[ignore]
 #[tokio::test]
 async fn test_read_causal_signed_certificates() {
-    const CURRENT_ROUND_METRIC: &str = "narwhal_primary_current_round";
+    const CURRENT_ROUND_METRIC: &str = "current_round";
 
     // Enabled debug tracing so we can easily observe the
     // nodes logs.
     let _guard = setup_tracing();
 
-    let mut cluster = Cluster::new(None, true);
+    let mut cluster = Cluster::new(None);
 
     // start the cluster
     cluster.start(Some(4), Some(1), None).await;
@@ -114,7 +112,7 @@ async fn test_read_causal_signed_certificates() {
 
     // Ensure all nodes advanced
     for authority in cluster.authorities().await {
-        if let Some(metric) = authority.primary().await.metric(CURRENT_ROUND_METRIC) {
+        if let Some(metric) = authority.primary().await.metric(CURRENT_ROUND_METRIC).await {
             let value = metric.get_gauge().get_value();
 
             info!("Metric -> {:?}", value);
@@ -143,7 +141,7 @@ async fn test_read_causal_signed_certificates() {
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        if let Some(metric) = node.metric(CURRENT_ROUND_METRIC) {
+        if let Some(metric) = node.metric(CURRENT_ROUND_METRIC).await {
             let value = metric.get_gauge().get_value();
             info!("Metric -> {:?}", value);
 

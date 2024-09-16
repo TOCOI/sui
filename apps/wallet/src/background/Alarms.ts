@@ -3,31 +3,22 @@
 
 import Browser from 'webextension-polyfill';
 
-import Keyring from './Keyring';
-import {
-    AUTO_LOCK_TIMER_DEFAULT_INTERVAL_MINUTES,
-    AUTO_LOCK_TIMER_STORAGE_KEY,
-} from '_src/shared/constants';
-
-export const LOCK_ALARM_NAME = 'lock-keyring-alarm';
+export const autoLockAlarmName = 'auto-lock-alarm';
+export const cleanUpAlarmName = 'clean-up-storage-alarm';
 
 class Alarms {
-    public async setLockAlarm() {
-        if (Keyring.isLocked) {
-            return;
-        }
-        const delayInMinutes = (
-            await Browser.storage.local.get({
-                [AUTO_LOCK_TIMER_STORAGE_KEY]:
-                    AUTO_LOCK_TIMER_DEFAULT_INTERVAL_MINUTES,
-            })
-        )[AUTO_LOCK_TIMER_STORAGE_KEY];
-        Browser.alarms.create(LOCK_ALARM_NAME, { delayInMinutes });
-    }
+	public async setAutoLockAlarm(minutes: number) {
+		Browser.alarms.create(autoLockAlarmName, { delayInMinutes: minutes });
+	}
 
-    public clearAlarm(name: string) {
-        return Browser.alarms.clear(name);
-    }
+	public clearAutoLockAlarm() {
+		return Browser.alarms.clear(autoLockAlarmName);
+	}
+
+	public async setCleanUpAlarm() {
+		await Browser.alarms.create(cleanUpAlarmName, { periodInMinutes: 60 * 6 }); //  every 6 hours
+	}
 }
 
-export default new Alarms();
+const alarms = new Alarms();
+export default alarms;

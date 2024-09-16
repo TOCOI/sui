@@ -1,48 +1,52 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-import { memo, useEffect } from 'react';
 
-import { Content } from '_app/shared/bottom-menu-layout';
-import PageTitle from '_app/shared/page-title';
-import Loading from '_components/loading';
-import TransactionCard from '_components/transactions-card';
-import { useAppSelector, useAppDispatch } from '_hooks';
-import { getTransactionsByAddress } from '_redux/slices/txresults';
+import FiltersPortal from '_components/filters-tags';
+import { isQredoAccountSerializedUI } from '_src/background/accounts/QredoAccount';
+import { useActiveAccount } from '_src/ui/app/hooks/useActiveAccount';
+import { useUnlockedGuard } from '_src/ui/app/hooks/useUnlockedGuard';
+import PageTitle from '_src/ui/app/shared/PageTitle';
+import cl from 'clsx';
+import { Navigate, useParams } from 'react-router-dom';
 
-import type { TxResultState } from '_redux/slices/txresults';
+import { CompletedTransactions } from './CompletedTransactions';
+import { QredoPendingTransactions } from './QredoPendingTransactions';
 
-import st from './Transactions.module.scss';
-
-function TransactionsPage() {
-    const dispatch = useAppDispatch();
-    const txByAddress: TxResultState[] = useAppSelector(
-        ({ txresults }) => txresults.latestTx
-    );
-
-    const loading: boolean = useAppSelector(
-        ({ txresults }) => txresults.loading
-    );
-
-    useEffect(() => {
-        dispatch(getTransactionsByAddress()).unwrap();
-    }, [dispatch]);
-
-    return (
-        <Loading loading={loading} className={st.centerLoading}>
-            {txByAddress && txByAddress.length ? (
-                <div className={st.container}>
-                    <PageTitle title="Your Activity" />
-                    <Content>
-                        <section className={st.txContent}>
-                            {txByAddress.map((txn) => (
-                                <TransactionCard txn={txn} key={txn.txId} />
-                            ))}
-                        </section>
-                    </Content>
-                </div>
-            ) : null}
-        </Loading>
-    );
+function TransactionBlocksPage() {
+	const activeAccount = useActiveAccount();
+	const isQredoAccount = !!(activeAccount && isQredoAccountSerializedUI(activeAccount));
+	const { status } = useParams();
+	const isPendingTransactions = status === 'pending';
+	if (useUnlockedGuard()) {
+		return null;
+	}
+	if (activeAccount && !isQredoAccount && isPendingTransactions) {
+		return <Navigate to="/transactions" replace />;
+	}
+	return (
+		<div className="flex flex-col flex-nowrap h-full overflow-x-visible">
+			{isQredoAccount ? (
+				<FiltersPortal
+					tags={[
+						{ name: 'Complete', link: 'transactions' },
+						{
+							name: 'Pending Transactions',
+							link: 'transactions/pending',
+						},
+					]}
+				/>
+			) : null}
+			<PageTitle title="Your Activity" />
+			<div
+				className={cl(
+					'mt-5 flex-grow overflow-y-auto px-5 -mx-5 divide-y divide-solid divide-gray-45 divide-x-0',
+					{ 'mb-4': isQredoAccount },
+				)}
+			>
+				{isPendingTransactions ? <QredoPendingTransactions /> : <CompletedTransactions />}
+			</div>
+		</div>
+	);
 }
 
-export default memo(TransactionsPage);
+export default TransactionBlocksPage;

@@ -1,41 +1,53 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { API_ENV, DEFAULT_API_ENV } from '_app/ApiProvider';
+import { DEFAULT_API_ENV } from '_app/ApiProvider';
+import { getUrlWithDeviceId } from '_src/shared/analytics/amplitude';
+import { API_ENV } from '_src/shared/api-env';
 
-import type { ObjectId, SuiAddress, TransactionDigest } from '@mysten/sui.js';
-
-const API_ENV_TO_EXPLORER_URL: Record<API_ENV, string | undefined> = {
-    [API_ENV.local]: process.env.EXPLORER_URL_LOCAL,
-    [API_ENV.devNet]: process.env.EXPLORER_URL_DEV_NET,
-    [API_ENV.staging]: process.env.EXPLORER_URL_STAGING,
+const API_ENV_TO_EXPLORER_ENV: Record<API_ENV, string | undefined> = {
+	[API_ENV.local]: 'local',
+	[API_ENV.devNet]: 'devnet',
+	[API_ENV.testNet]: 'testnet',
+	[API_ENV.mainnet]: 'mainnet',
+	[API_ENV.customRPC]: '',
 };
 
-// TODO: rewrite this
-function getDefaultUrl(apiEnv?: API_ENV) {
-    const url = API_ENV_TO_EXPLORER_URL[apiEnv || DEFAULT_API_ENV];
-    if (!url) {
-        throw new Error(`Url for API_ENV ${DEFAULT_API_ENV} is not defined`);
-    }
-    return url;
+const EXPLORER_LINK = 'https://suiexplorer.com/';
+
+//TODO - this is a temporary solution, we should have a better way to get the explorer url
+function getExplorerUrl(path: string, apiEnv: API_ENV = DEFAULT_API_ENV, customRPC: string) {
+	const explorerEnv = apiEnv === 'customRPC' ? customRPC : API_ENV_TO_EXPLORER_ENV[apiEnv];
+
+	const url = getUrlWithDeviceId(new URL(path, EXPLORER_LINK));
+	if (explorerEnv) {
+		url.searchParams.append('network', explorerEnv);
+	}
+
+	return url.href;
 }
 
-export class Explorer {
-    public static getObjectUrl(objectID: ObjectId, apiEnv: API_ENV) {
-        return new URL(`/objects/${objectID}`, getDefaultUrl(apiEnv)).href;
-    }
+export function getObjectUrl(
+	objectID: string,
+	apiEnv: API_ENV,
+	customRPC: string,
+	moduleName?: string | null,
+) {
+	return getExplorerUrl(
+		`/object/${objectID}${moduleName ? `?module=${moduleName}` : ''}`,
+		apiEnv,
+		customRPC,
+	);
+}
 
-    public static getTransactionUrl(
-        txDigest: TransactionDigest,
-        apiEnv: API_ENV
-    ) {
-        return new URL(
-            `/transactions/${encodeURIComponent(txDigest)}`,
-            getDefaultUrl(apiEnv)
-        ).href;
-    }
+export function getTransactionUrl(txDigest: string, apiEnv: API_ENV, customRPC: string) {
+	return getExplorerUrl(`/txblock/${encodeURIComponent(txDigest)}`, apiEnv, customRPC);
+}
 
-    public static getAddressUrl(address: SuiAddress, apiEnv: API_ENV) {
-        return new URL(`/addresses/${address}`, getDefaultUrl(apiEnv)).href;
-    }
+export function getAddressUrl(address: string, apiEnv: API_ENV, customRPC: string) {
+	return getExplorerUrl(`/address/${address}`, apiEnv, customRPC);
+}
+
+export function getValidatorUrl(address: string, apiEnv: API_ENV, customRPC: string) {
+	return getExplorerUrl(`/validator/${address}`, apiEnv, customRPC);
 }

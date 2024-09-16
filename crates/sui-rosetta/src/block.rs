@@ -1,28 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
+use axum::extract::State;
 use axum::{Extension, Json};
-use sui_types::gas_coin::GasCoin;
-use sui_types::object::PastObjectRead;
+use axum_extra::extract::WithRejection;
 use tracing::debug;
 
-use crate::operations::Operation;
+use crate::operations::Operations;
 use crate::types::{
     BlockRequest, BlockResponse, BlockTransactionRequest, BlockTransactionResponse, Transaction,
     TransactionIdentifier,
 };
 use crate::{Error, OnlineServerContext, SuiEnv};
+use sui_json_rpc_types::SuiTransactionBlockResponseOptions;
 
 /// This module implements the [Rosetta Block API](https://www.rosetta-api.org/docs/BlockApi.html)
 
 /// Get a block by its Block Identifier.
 /// [Rosetta API Spec](https://www.rosetta-api.org/docs/BlockApi.html#block)
 pub async fn block(
-    Json(request): Json<BlockRequest>,
-    Extension(state): Extension<Arc<OnlineServerContext>>,
+    State(state): State<OnlineServerContext>,
     Extension(env): Extension<SuiEnv>,
+    WithRejection(Json(request), _): WithRejection<Json<BlockRequest>, Error>,
 ) -> Result<BlockResponse, Error> {
     debug!("Called /block endpoint: {:?}", request.block_identifier);
     env.check_network_identifier(&request.network_identifier)?;
@@ -39,28 +38,27 @@ pub async fn block(
 /// Get a transaction in a block by its Transaction Identifier.
 /// [Rosetta API Spec](https://www.rosetta-api.org/docs/BlockApi.html#blocktransaction)
 pub async fn transaction(
-    Json(request): Json<BlockTransactionRequest>,
-    Extension(context): Extension<Arc<OnlineServerContext>>,
+    State(context): State<OnlineServerContext>,
     Extension(env): Extension<SuiEnv>,
+    WithRejection(Json(request), _): WithRejection<Json<BlockTransactionRequest>, Error>,
 ) -> Result<BlockTransactionResponse, Error> {
     env.check_network_identifier(&request.network_identifier)?;
     let digest = request.transaction_identifier.hash;
-    let (cert, effects) = context.state.get_transaction(digest).await?;
-    let hash = *cert.digest();
-    let data = &cert.signed_data.data;
+    let response = context
+        .client
+        .read_api()
+        .get_transaction_with_options(
+            digest,
+            SuiTransactionBlockResponseOptions::new()
+                .with_input()
+                .with_events()
+                .with_effects()
+                .with_balance_changes(),
+        )
+        .await?;
+    let hash = response.digest;
 
-    let mut new_coins = vec![];
-    for ((id, version, _), _) in &effects.created {
-        if let Ok(PastObjectRead::VersionFound(oref, obj, _)) =
-            context.state.get_past_object_read(id, *version).await
-        {
-            if let Ok(coin) = GasCoin::try_from(&obj) {
-                new_coins.push((coin, oref))
-            }
-        }
-    }
-
-    let operations = Operation::from_data_and_effect(data, &effects, &new_coins)?;
+    let operations = Operations::try_from_response(response, &context.coin_metadata_cache).await?;
 
     let transaction = Transaction {
         transaction_identifier: TransactionIdentifier { hash },

@@ -5,31 +5,25 @@ mod state;
 mod subscriber;
 
 mod metrics;
-mod notifier;
 
 pub use errors::{SubscriberError, SubscriberResult};
 pub use state::ExecutionIndices;
-use tracing::info;
+use sui_protocol_config::ProtocolConfig;
 
 use crate::metrics::ExecutorMetrics;
-use crate::notifier::Notifier;
-use async_trait::async_trait;
-use config::{Committee, SharedWorkerCache};
-use consensus::ConsensusOutput;
-use crypto::PublicKey;
-use network::P2pNetwork;
-
-use prometheus::Registry;
-
-use std::sync::Arc;
-use storage::CertificateStore;
-
 use crate::subscriber::spawn_subscriber;
-use tokio::sync::oneshot;
-use tokio::{sync::watch, task::JoinHandle};
-use types::{
-    metered_channel, CertificateDigest, ConsensusStore, ReconfigureNotification, SequenceNumber,
-};
+
+use async_trait::async_trait;
+use config::{AuthorityIdentifier, Committee, WorkerCache};
+use mockall::automock;
+use mysten_metrics::metered_channel;
+use network::client::NetworkClient;
+use prometheus::Registry;
+use std::sync::Arc;
+use storage::{CertificateStore, ConsensusStore};
+use tokio::task::JoinHandle;
+use tracing::info;
+use types::{CertificateDigest, CommittedSubDag, ConditionalBroadcastReceiver, ConsensusOutput};
 
 /// Convenience type representing a serialized transaction.
 pub type SerializedTransaction = Vec<u8>;
@@ -37,20 +31,17 @@ pub type SerializedTransaction = Vec<u8>;
 /// Convenience type representing a serialized transaction digest.
 pub type SerializedTransactionDigest = u64;
 
+#[automock]
 #[async_trait]
 pub trait ExecutionState {
-    /// Execute the transaction and atomically persist the consensus index. This function
-    /// returns an execution outcome that will be output by the executor channel. It may
-    /// also return a new committee to reconfigure the system.
-    async fn handle_consensus_transaction(
-        &self,
-        consensus_output: &Arc<ConsensusOutput>,
-        execution_indices: ExecutionIndices,
-        transaction: Vec<u8>,
-    );
+    /// Execute the transaction and atomically persist the consensus index.
+    async fn handle_consensus_output(&mut self, consensus_output: ConsensusOutput);
 
-    /// Load the last consensus index from storage.
-    async fn load_execution_indices(&self) -> ExecutionIndices;
+    /// The last executed sub-dag / commit leader round.
+    fn last_executed_sub_dag_round(&self) -> u64;
+
+    /// The last executed sub-dag / commit index.
+    fn last_executed_sub_dag_index(&self) -> u64;
 }
 
 /// A client subscribing to the consensus output and executing every transaction.
@@ -59,46 +50,43 @@ pub struct Executor;
 impl Executor {
     /// Spawn a new client subscriber.
     pub fn spawn<State>(
-        name: PublicKey,
-        network: oneshot::Receiver<P2pNetwork>,
-        worker_cache: SharedWorkerCache,
+        authority_id: AuthorityIdentifier,
+        worker_cache: WorkerCache,
         committee: Committee,
+        protocol_config: &ProtocolConfig,
+        client: NetworkClient,
         execution_state: State,
-        tx_reconfigure: &watch::Sender<ReconfigureNotification>,
-        rx_sequence: metered_channel::Receiver<ConsensusOutput>,
+        shutdown_receivers: Vec<ConditionalBroadcastReceiver>,
+        rx_sequence: metered_channel::Receiver<CommittedSubDag>,
         registry: &Registry,
-        restored_consensus_output: Vec<ConsensusOutput>,
+        restored_consensus_output: Vec<CommittedSubDag>,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
     where
         State: ExecutionState + Send + Sync + 'static,
     {
         let metrics = ExecutorMetrics::new(registry);
 
-        let (tx_notifier, rx_notifier) =
-            metered_channel::channel(primary::CHANNEL_CAPACITY, &metrics.tx_notifier);
-
-        // We expect this will ultimately be needed in the `Core` as well as the `Subscriber`.
+        // This will be needed in the `Subscriber`.
         let arc_metrics = Arc::new(metrics);
 
         // Spawn the subscriber.
-        let subscriber_handle = spawn_subscriber(
-            name,
-            network,
+        let subscriber_handles = spawn_subscriber(
+            authority_id,
             worker_cache,
             committee,
-            tx_reconfigure.subscribe(),
+            protocol_config.clone(),
+            client,
+            shutdown_receivers,
             rx_sequence,
-            tx_notifier,
-            arc_metrics.clone(),
+            arc_metrics,
             restored_consensus_output,
+            execution_state,
         );
-
-        let notifier_handler = Notifier::spawn(rx_notifier, execution_state, arc_metrics);
 
         // Return the handle.
         info!("Consensus subscriber successfully started");
 
-        Ok(vec![subscriber_handle, notifier_handler])
+        Ok(subscriber_handles)
     }
 }
 
@@ -106,52 +94,36 @@ pub async fn get_restored_consensus_output<State: ExecutionState>(
     consensus_store: Arc<ConsensusStore>,
     certificate_store: CertificateStore,
     execution_state: &State,
-) -> Result<Vec<ConsensusOutput>, SubscriberError> {
-    let mut restored_consensus_output = Vec::new();
-    let consensus_next_index = consensus_store
-        .read_last_consensus_index()
-        .map_err(SubscriberError::StoreError)?;
+) -> Result<Vec<CommittedSubDag>, SubscriberError> {
+    // We always want to recover at least the last committed sub-dag since we can't know
+    // whether the execution has been interrupted and there are still batches/transactions
+    // that need to be sent for execution.
 
-    let next_cert_index = execution_state
-        .load_execution_indices()
-        .await
-        .next_certificate_index;
+    let last_executed_sub_dag_index = execution_state.last_executed_sub_dag_index();
 
-    if next_cert_index < consensus_next_index {
-        let missing = consensus_store
-            .read_sequenced_certificates(&(next_cert_index..=consensus_next_index - 1))?
-            .iter()
-            .zip(next_cert_index..consensus_next_index)
-            .filter_map(|(c, seq)| c.map(|digest| (digest, seq)))
-            .collect::<Vec<(CertificateDigest, SequenceNumber)>>();
+    let compressed_sub_dags =
+        consensus_store.read_committed_sub_dags_from(&last_executed_sub_dag_index)?;
 
-        for (cert_digest, seq) in missing {
-            if let Some(cert) = certificate_store.read(cert_digest).unwrap() {
-                // Save the missing sequence / cert pair as ConsensusOutput to re-send to the executor.
-                restored_consensus_output.push(ConsensusOutput {
-                    certificate: cert,
-                    consensus_index: seq,
-                })
-            }
-        }
-    }
-    Ok(restored_consensus_output)
-}
+    let mut sub_dags = Vec::new();
+    for compressed_sub_dag in compressed_sub_dags {
+        let certificate_digests: Vec<CertificateDigest> = compressed_sub_dag.certificates();
 
-#[async_trait]
-impl<T: ExecutionState + 'static + Send + Sync> ExecutionState for Arc<T> {
-    async fn handle_consensus_transaction(
-        &self,
-        consensus_output: &Arc<ConsensusOutput>,
-        execution_indices: ExecutionIndices,
-        transaction: Vec<u8>,
-    ) {
-        self.as_ref()
-            .handle_consensus_transaction(consensus_output, execution_indices, transaction)
-            .await
+        let certificates = certificate_store
+            .read_all(certificate_digests)?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let leader = certificate_store
+            .read(compressed_sub_dag.leader())?
+            .unwrap();
+
+        sub_dags.push(CommittedSubDag::from_commit(
+            compressed_sub_dag,
+            certificates,
+            leader,
+        ));
     }
 
-    async fn load_execution_indices(&self) -> ExecutionIndices {
-        self.as_ref().load_execution_indices().await
-    }
+    Ok(sub_dags)
 }

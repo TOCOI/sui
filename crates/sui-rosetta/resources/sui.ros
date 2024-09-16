@@ -6,10 +6,10 @@ transfer(10){
       "minimum_balance":{
         "value": "100000",
         "currency": {{currency}}
-      },
-      "require_coin": true
+      }
     });
     recipient_amount = random_number({"minimum": "1", "maximum": "100000"});
+    sender_amount = 0 - {{recipient_amount}};
     print_message({"recipient_amount":{{recipient_amount}}});
 
     // Find recipient and construct operations
@@ -24,18 +24,20 @@ transfer(10){
     transfer.operations = [
       {
         "operation_identifier":{"index":0},
-        "type":"TransferSUI",
-        "account":{{sender.account_identifier}},
-        "coin_change":{"coin_action":"coin_spent", "coin_identifier":{{sender.coin}}},
-        "metadata":{"recipient":{{recipient.account_identifier.address}}, "amount": {{recipient_amount}}}
+        "type":"PaySui",
+        "account":{{recipient.account_identifier}},
+        "amount":{
+          "value":{{recipient_amount}},
+          "currency":{{currency}}
+        }
       },
       {
         "operation_identifier":{"index":1},
-        "type":"GasBudget",
+        "type":"PaySui",
         "account":{{sender.account_identifier}},
-        "coin_change":{"coin_action":"coin_spent", "coin_identifier":{{sender.coin}}},
-        "metadata":{
-          "budget": "1000"
+        "amount":{
+          "value":{{sender_amount}},
+          "currency":{{currency}}
         }
       }];
   }

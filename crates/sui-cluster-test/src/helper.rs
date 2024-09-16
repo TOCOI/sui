@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::bail;
-use sui_json_rpc_types::{GetRawObjectDataResponse, SuiData, SuiEvent, SuiRawObject};
-use sui_types::gas_coin::GasCoin;
-use sui_types::{
-    base_types::{ObjectID, SequenceNumber, SuiAddress},
-    event::TransferType,
-    object::Owner,
-};
-
+use move_core_types::language_storage::TypeTag;
+use sui_json_rpc_types::{BalanceChange, SuiData, SuiObjectData, SuiObjectDataOptions};
 use sui_sdk::SuiClient;
+use sui_types::error::SuiObjectResponseError;
+use sui_types::gas_coin::GasCoin;
+use sui_types::{base_types::ObjectID, object::Owner, parse_sui_type_tag};
 use tracing::{debug, trace};
 
 /// A util struct that helps verify Sui Object.
@@ -18,9 +15,8 @@ use tracing::{debug, trace};
 /// When optionals fields are not set, related checks are omitted.
 /// Consuming functions such as `check` perform the check and panics if
 /// verification results are unexpected. `check_into_object` and
-/// `check_into_gas_coin` expect to get a `SuiRawObject` and `GasCoin`
+/// `check_into_gas_coin` expect to get a `SuiObjectData` and `GasCoin`
 /// respectfully.
-/// ```
 #[derive(Debug)]
 pub struct ObjectChecker {
     object_id: ObjectID,
@@ -65,7 +61,7 @@ impl ObjectChecker {
             .into_gas_coin()
     }
 
-    pub async fn check_into_object(self, client: &SuiClient) -> SuiRawObject {
+    pub async fn check_into_object(self, client: &SuiClient) -> SuiObjectData {
         self.check(client).await.unwrap().into_object()
     }
 
@@ -75,40 +71,70 @@ impl ObjectChecker {
         let object_id = self.object_id;
         let object_info = client
             .read_api()
-            .get_object(object_id)
+            .get_object_with_options(
+                object_id,
+                SuiObjectDataOptions::new()
+                    .with_type()
+                    .with_owner()
+                    .with_bcs(),
+            )
             .await
             .or_else(|err| bail!("Failed to get object info (id: {}), err: {err}", object_id))?;
 
         trace!("getting object {object_id}, info :: {object_info:?}");
 
-        match object_info {
-            GetRawObjectDataResponse::NotExists(_) => {
+        match (object_info.data, object_info.error) {
+            (None, Some(SuiObjectResponseError::NotExists { object_id })) => {
                 panic!(
                     "Node can't find gas object {} with client {:?}",
                     object_id,
                     client.read_api()
                 )
             }
-            GetRawObjectDataResponse::Deleted(_) => {
+            (
+                None,
+                Some(SuiObjectResponseError::DynamicFieldNotFound {
+                    parent_object_id: object_id,
+                }),
+            ) => {
+                panic!(
+                    "Node can't find dynamic field for {} with client {:?}",
+                    object_id,
+                    client.read_api()
+                )
+            }
+            (
+                None,
+                Some(SuiObjectResponseError::Deleted {
+                    object_id,
+                    version: _,
+                    digest: _,
+                }),
+            ) => {
                 if !self.is_deleted {
                     panic!("Gas object {} was deleted", object_id);
                 }
                 Ok(CheckerResultObject::new(None, None))
             }
-            GetRawObjectDataResponse::Exists(object) => {
+            (Some(object), _) => {
                 if self.is_deleted {
                     panic!("Expect Gas object {} deleted, but it is not", object_id);
                 }
                 if let Some(owner) = self.owner {
+                    let object_owner = object
+                        .owner
+                        .unwrap_or_else(|| panic!("Object {} does not have owner", object_id));
                     assert_eq!(
-                        object.owner, owner,
+                        object_owner, owner,
                         "Gas coin {} does not belong to {}, but {}",
-                        object_id, owner, object.owner
+                        object_id, owner, object_owner
                     );
                 }
                 if self.is_sui_coin == Some(true) {
                     let move_obj = object
-                        .data
+                        .bcs
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("Object {} does not have bcs data", object_id))
                         .try_as_move()
                         .unwrap_or_else(|| panic!("Object {} is not a move object", object_id));
 
@@ -117,23 +143,29 @@ impl ObjectChecker {
                 }
                 Ok(CheckerResultObject::new(None, Some(object)))
             }
+            (None, Some(SuiObjectResponseError::DisplayError { error })) => {
+                panic!("Display Error: {error:?}");
+            }
+            (None, None) | (None, Some(SuiObjectResponseError::Unknown)) => {
+                panic!("Unexpected response: object not found and no specific error provided");
+            }
         }
     }
 }
 
 pub struct CheckerResultObject {
     gas_coin: Option<GasCoin>,
-    object: Option<SuiRawObject>,
+    object: Option<SuiObjectData>,
 }
 
 impl CheckerResultObject {
-    pub fn new(gas_coin: Option<GasCoin>, object: Option<SuiRawObject>) -> Self {
+    pub fn new(gas_coin: Option<GasCoin>, object: Option<SuiObjectData>) -> Self {
         Self { gas_coin, object }
     }
     pub fn into_gas_coin(self) -> GasCoin {
         self.gas_coin.unwrap()
     }
-    pub fn into_object(self) -> SuiRawObject {
+    pub fn into_object(self) -> SuiObjectData {
         self.object.unwrap()
     }
 }
@@ -153,82 +185,40 @@ macro_rules! assert_eq_if_present {
 }
 
 #[derive(Default, Debug)]
-pub struct TransferObjectEventChecker {
-    package_id: Option<ObjectID>,
-    transaction_module: Option<String>,
-    sender: Option<SuiAddress>,
-    recipient: Option<Owner>,
-    object_id: Option<ObjectID>,
-    version: Option<SequenceNumber>,
-    type_: Option<TransferType>,
-    amount: Option<u64>,
+pub struct BalanceChangeChecker {
+    owner: Option<Owner>,
+    coin_type: Option<TypeTag>,
+    amount: Option<i128>,
 }
 
-impl TransferObjectEventChecker {
+impl BalanceChangeChecker {
     pub fn new() -> Self {
         Default::default()
     }
 
-    pub fn package_id(mut self, package_id: ObjectID) -> Self {
-        self.package_id = Some(package_id);
+    pub fn owner(mut self, owner: Owner) -> Self {
+        self.owner = Some(owner);
         self
     }
-    pub fn transaction_module(mut self, transaction_module: String) -> Self {
-        self.transaction_module = Some(transaction_module);
-        self
-    }
-    pub fn sender(mut self, sender: SuiAddress) -> Self {
-        self.sender = Some(sender);
-        self
-    }
-    pub fn recipient(mut self, recipient: Owner) -> Self {
-        self.recipient = Some(recipient);
-        self
-    }
-    pub fn object_id(mut self, object_id: ObjectID) -> Self {
-        self.object_id = Some(object_id);
-        self
-    }
-    pub fn version(mut self, version: SequenceNumber) -> Self {
-        self.version = Some(version);
-        self
-    }
-    pub fn type_(mut self, type_: TransferType) -> Self {
-        self.type_ = Some(type_);
+    pub fn coin_type(mut self, coin_type: &str) -> Self {
+        self.coin_type = Some(parse_sui_type_tag(coin_type).unwrap());
         self
     }
 
-    pub fn amount(mut self, amount: u64) -> Self {
+    pub fn amount(mut self, amount: i128) -> Self {
         self.amount = Some(amount);
         self
     }
 
-    pub fn check(self, event: &SuiEvent) {
-        if let SuiEvent::TransferObject {
-            package_id,
-            transaction_module,
-            sender,
-            recipient,
-            object_id,
-            version,
-            type_,
+    pub fn check(self, event: &BalanceChange) {
+        let BalanceChange {
+            owner,
+            coin_type,
             amount,
-        } = event
-        {
-            assert_eq_if_present!(self.package_id, package_id, "package_id");
-            assert_eq_if_present!(
-                self.transaction_module,
-                transaction_module,
-                "transaction_module"
-            );
-            assert_eq_if_present!(self.sender, sender, "sender");
-            assert_eq_if_present!(self.recipient, recipient, "recipient");
-            assert_eq_if_present!(self.object_id, object_id, "object_id");
-            assert_eq_if_present!(self.version, version, "version");
-            assert_eq_if_present!(self.type_, type_, "type_");
-            assert_eq_if_present!(self.amount, amount.as_ref().unwrap(), "amount");
-        } else {
-            panic!("event {:?} is not TransferObject Event", event);
-        }
+        } = event;
+
+        assert_eq_if_present!(self.owner, owner, "owner");
+        assert_eq_if_present!(self.coin_type, coin_type, "coin_type");
+        assert_eq_if_present!(self.amount, amount, "version");
     }
 }
